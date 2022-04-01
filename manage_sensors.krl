@@ -6,13 +6,13 @@ ruleset manage_sensors {
     >>
     author "Tyla Evans"
     provides sensors, temperatures, reports
-    shares sensors, temperatures, reports
+    shares sensors, temperatures, reports, num_violations
     use module io.picolabs.wrangler alias wrangler
     use module io.picolabs.subscription alias subs
   }
 
   global {
-    default_threshold = 78
+    default_threshold = 75
 
     sensors = function() {
       subs:established().filter(
@@ -44,6 +44,16 @@ ruleset manage_sensors {
       num = ((ent:reports.length() < 5) => (ent:reports.length() - 1) | 4).klog("num reports:")
       report_ids = (ent:reports.keys().reverse().slice(num))
       ent:reports.filter(function(v,k){report_ids >< k})
+    }
+
+    num_violations = function() {
+      return sensors().reduce(
+        function(acc, sensor){
+          eci = sensor{"Tx"}.klog("eci:")
+          host = (sensor{"Tx_host"}.defaultsTo(meta:host)).klog("host:")
+          experiencing_violation = wrangler:picoQuery(eci,"gossip","experiencing_violation",{}, host)
+          return experiencing_violation => acc + 1 | acc
+        }, 0)
     }
   }
 

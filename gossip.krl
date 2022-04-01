@@ -7,7 +7,8 @@ ruleset gossip {
     author "Tyla Evans"
     use module temperature_store alias temp_store
     use module io.picolabs.subscription alias subs
-    shares name, temp_log, seen, seen_by_me
+    use module sensor_profile alias profile
+    shares name, temp_log, seen, seen_by_me, violation_log, message_log, violation_count, experiencing_violation
   }
 
   global {
@@ -83,12 +84,12 @@ ruleset gossip {
 
     prepareMessage = function(node_id, num) {
       message_id = node_id + ":" + num
-      ent:temp_log{node_id}{message_id}
+      ent:message_log{node_id}{message_id}
     }
 
     calculateLastSeen = function(node_id, num) {
       next_message_id = (node_id + ":" + (num + 1)).klog("checking for message:")
-      ent:temp_log{node_id} >< next_message_id =>
+      ent:message_log{node_id} >< next_message_id =>
         calculateLastSeen(node_id, num + 1) |
         num
     }
@@ -98,7 +99,27 @@ ruleset gossip {
     }
 
     temp_log = function() {
-      ent:temp_log
+      ent:message_log.map(
+        function(messages,sensor) {
+          messages_to_keep = messages.filter(function(message,message_id) {
+            message{"Temperature"}
+          })
+          return messages_to_keep
+      })
+    }
+
+    violation_log = function() {
+      ent:message_log.map(
+        function(messages,sensor) {
+          messages_to_keep = messages.filter(function(message,message_id) {
+            message{"Operation"}
+          })
+          return messages_to_keep
+      })
+    }
+
+    message_log = function() {
+      ent:message_log
     }
 
     seen = function() {
@@ -107,6 +128,14 @@ ruleset gossip {
 
     seen_by_me = function() {
       ent:my_seen
+    }
+
+    violation_count = function() {
+      ent:violation_count
+    }
+
+    experiencing_violation = function() {
+      ent:experiencing_violation
     }
   }
 
@@ -119,9 +148,12 @@ ruleset gossip {
       ent:name := name
       ent:sequence_num := 0
       ent:seen := {}
-      ent:temp_log := {}
+      ent:message_log := {}
       ent:my_seen := {}
       ent:process := true
+      ent:violation_count := 0
+      ent:experiencing_violation := false
+      ent:violation_reported := false
     }
   }
 
@@ -130,9 +162,12 @@ ruleset gossip {
     always {
       ent:sequence_num := 0
       ent:seen := {}
-      ent:temp_log := {}
+      ent:message_log := {}
       ent:my_seen := {}
       ent:process := true
+      ent:violation_count := 0
+      ent:experiencing_violation := false
+      ent:violation_reported := false
     }
   }
 
@@ -152,8 +187,70 @@ ruleset gossip {
     }
     if ent:process then noop()
     fired {
-      ent:temp_log := ent:temp_log.put([ent:name, message_id], message)
+      ent:message_log := ent:message_log.put([ent:name, message_id], message)
       ent:my_seen{ent:name} := ent:sequence_num
+    }
+  }
+
+  rule check_for_violation {
+    select when wovyn new_temperature_reading
+      temperature re#^(\d+[.]?\d*)$#
+      timestamp re#^(.+)$#
+      setting(temp, time)
+    pre {
+      threshold = profile:profile(){"temperature_threshold"}
+      is_violation = temp > threshold
+    }
+    always {
+      raise sensor event "violation_ended"
+      if (ent:experiencing_violation && not is_violation)
+
+      raise sensor event "violation_began"
+      if (is_violation && not ent:experiencing_violation && not ent:violation_reported)
+    }
+  }
+
+  rule record_end_of_violation {
+    select when sensor violation_ended
+    pre {
+      seq_num = ent:message_log{ent:name} >< (ent:name + ":" + ent:sequence_num) => ent:sequence_num + 1 | ent:sequence_num
+      message_id = ent:name + ":" + seq_num
+      message = {
+          "MessageID": message_id,
+          "SensorID": ent:name,
+          "Operation": -1,
+        }
+    }
+    if ent:process then noop()
+    fired {
+      ent:message_log := ent:message_log.put([ent:name, message_id], message)
+      ent:sequence_num := seq_num + 1
+      ent:my_seen{ent:name} := seq_num
+      ent:violation_count := ent:violation_count - 1
+      ent:experiencing_violation := false
+      ent:violation_reported := false
+    }
+  }
+
+  rule record_beginning_of_violation {
+    select when sensor violation_began
+    pre {
+      seq_num = ent:message_log{ent:name} >< (ent:name + ":" + ent:sequence_num) => ent:sequence_num + 1 | ent:sequence_num
+      message_id = ent:name + ":" + seq_num
+      message = {
+          "MessageID": message_id,
+          "SensorID": ent:name,
+          "Operation": 1,
+        }
+    }
+    if ent:process then noop()
+    fired {
+      ent:message_log := ent:message_log.put([ent:name, message_id], message)
+      ent:sequence_num := seq_num + 1
+      ent:my_seen{ent:name} := seq_num
+      ent:violation_count := ent:violation_count + 1
+      ent:experiencing_violation := true
+      ent:violation_reported := true
     }
   }
 
@@ -241,7 +338,7 @@ ruleset gossip {
       "attrs": {"message": message}
     }, receiver{"host"})
     fired {
-      ent:sequence_num := ((node_id == ent:name) && (num == ent:sequence_num)).klog("update sequence num:") =>
+      ent:sequence_num := ((node_id == ent:name) && (num == ent:sequence_num) && (message{"Temperature"})).klog("update sequence num:") =>
         ent:sequence_num + 1 |
         ent:sequence_num
       ent:seen := (num > last_seen) =>
@@ -265,6 +362,21 @@ ruleset gossip {
       }, receiver{"host"})
   }
 
+  rule update_violation_count {
+    select when gossip:rumor
+    pre {
+      message = event:attrs{"message"}
+      message_id = message{"MessageID"}.klog("message id:")
+      sensor_id = message{"SensorID"}
+      current_messages = ent:message_log{sensor_id}.klog("current messages:")
+      operation = message{"Operation"}.klog("operation:")
+    }
+    if ent:process && operation != null && not (ent:message_log{sensor_id} >< message_id) then noop()
+    fired {
+      ent:violation_count := ent:violation_count + operation
+    }
+  }
+
   rule update_log {
     select when gossip:rumor
     pre {
@@ -275,7 +387,7 @@ ruleset gossip {
     }
     if ent:process then noop()
     fired {
-      ent:temp_log := ent:temp_log.put([sensor_id, message{"MessageID"}], message)
+      ent:message_log := ent:message_log.put([sensor_id, message{"MessageID"}], message)
       ent:my_seen := (num == (last_seen + 1)) =>
         ent:my_seen.put([sensor_id], calculateLastSeen(sensor_id, num)) |
         ent:my_seen
